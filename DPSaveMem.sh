@@ -2,11 +2,11 @@
 
 for dataset in "wiki-vote" "epinions" "wikisigned" "youtube" "pokec" "dbpedia"
 do
-    for mech in 2 3
+    for mech in 0 3
     do
-        for eps in 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0
+        for eps in 0.05 0.1 0.15 0.2 0.25 0.3 0.35 0.4 0.45 0.5
         do
-            ./LDP $dataset $eps 2-9-9 $mech 1.0 1 100
+            ./DPSaveMem $dataset $eps $mech 1.0 1 100
         done
     done
 done

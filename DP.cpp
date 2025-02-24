@@ -2,20 +2,18 @@
 #include <string>
 #include <fstream>
 #include <cmath>
-#include <map>
-#include <unordered_map>
 #include <algorithm>
 
 #include <string.h>
 #include <math.h>
-#include <time.h>
-// #include <unistd.h>
 
-#include "include/stats.hpp"
 #include "include/mt19937ar.h"
+#include "include/stats.hpp"
+#include "include/parallel_hashmap/phmap.h"
 
 
 using namespace std;
+using phmap::flat_hash_map;
 
 // initialization of statslib
 stats::rand_engine_t engine(12306);
@@ -58,13 +56,14 @@ bool check_file_existence(const string &file_path){
 }
 
 
-int get_total_num_nodes(const string &edge_path){
+int total_nodes_count(const string &edge_path){
     FILE *fp;
     char str[1025];
     char *ptr, *temp;
     int total_num_nodes = 0;
 
     fp = open_file(edge_path, "r");
+    // find the number of nodes
     temp = fgets(str, 1024, fp);
     ptr = strchr(str, '#');
     total_num_nodes = atoi(ptr + 1);
@@ -75,25 +74,23 @@ int get_total_num_nodes(const string &edge_path){
 
 
 // randomly generate 0, 1, 2, ..., size-1, and store the first 'num' values into rndperm
-void generate_random_permutation(vector<int> &rndperm, int size, int num){
-    int rnd;
-    vector<int> ordperm(size);
-    // 0, 1, 2, ..., size-1 --> ordperm
-    for(int i=0; i<size; ++i){
-        ordperm[i] = i;
+void create_random_permutation(std::vector<int> &rndperm, int size, int num) {
+    std::vector<int> ordperm(size);
+    // create an ordered permutation
+    std::iota(ordperm.begin(), ordperm.end(), 0);
+    
+    // Fisher-Yates shuffle
+    for (int i = 0; i < num; ++i) {
+        int rnd = i + (genrand_int32() % (size - i));
+        std::swap(ordperm[i], ordperm[rnd]);
+        rndperm[i] = ordperm[i];
     }
-    for(int i=0; i<num; ++i){
-        rnd = genrand_int32() % (size - i);
-        rndperm[i] = ordperm[rnd];
-        for(int j=rnd+1; j<size-i; ++j){
-            ordperm[j - 1] = ordperm[j];
-        }
-    }
-    vector<int>().swap(ordperm);
+    ordperm.clear();
+    ordperm.shrink_to_fit();
 }
 
 
-void generate_node_order(const string &dataset, int &num_sample_nodes, const int &total_num_nodes, int &num_iters, vector<vector<int>> &node_order){
+void create_node_order(const string &dataset, int &num_sample_nodes, const int &total_num_nodes, int &num_iters, vector<vector<int>> &node_order){
     if(num_sample_nodes == total_num_nodes){ // use all nodes to calculate the number of triangles
         num_iters = 1;
         node_order = vector<vector<int>>(num_iters, vector<int>(total_num_nodes));
@@ -102,7 +99,7 @@ void generate_node_order(const string &dataset, int &num_sample_nodes, const int
         }
     } else{ // randomly generate the order of nodes --> node_order
         FILE *fp;
-        string outfile = "./results/"+dataset+"/node_order_iters_"+to_string(num_iters)+".csv";
+        string outfile = "./data/"+dataset+"_node_order_iters_"+to_string(num_iters)+".csv";
         int i, j;
         node_order = vector<vector<int>>(num_iters, vector<int>(total_num_nodes));
         if(check_file_existence(outfile)){
@@ -119,7 +116,7 @@ void generate_node_order(const string &dataset, int &num_sample_nodes, const int
             fclose(fp);
         } else{
             for(j=0; j<num_iters; ++j){
-                generate_random_permutation(node_order[j], total_num_nodes, total_num_nodes);
+                create_random_permutation(node_order[j], total_num_nodes, total_num_nodes);
             }
             fp = open_file(outfile, "w");
             for(i=0; i<total_num_nodes; ++i){
@@ -136,16 +133,16 @@ void generate_node_order(const string &dataset, int &num_sample_nodes, const int
 
 
 // load adjacency list from the edge file
-void load_adj_list(const string &edge_path, vector<int> &node_order, vector<unordered_map<int, int>> &adj_list){
+vector<int> load_adj_list(const string &edge_path, vector<int> &node_order, vector<flat_hash_map<int, int8_t>> &adj_list){
     int node1, node2, sign;
-    FILE *fp;
-    char str[1025];
-    char *tok, *temp;
+    int map_node1, map_node2;
+    char str[1025], *tok;
     int num_nodes = adj_list.size();
+    vector<int> degree(num_nodes, 0);
 
-    fp = open_file(edge_path, "r");
+    FILE *fp = open_file(edge_path, "r");
     // skip the first line of data
-    temp = fgets(str, 1024, fp);
+    char *temp = fgets(str, 1024, fp);
     while(fgets(str, 1024, fp) != NULL){
         // 1st node --> node1
         // ascii(string) to int
@@ -154,36 +151,31 @@ void load_adj_list(const string &edge_path, vector<int> &node_order, vector<unor
         // 2nd node --> node2
         tok = strtok(NULL, ",");
         node2 = atoi(tok);
+        if(node1 == node2) continue;
+
+        map_node1 = node_order[node1];
+        map_node2 = node_order[node2];
+        if(map_node1 >= num_nodes || map_node2 >= num_nodes) continue;
+
         // sign
         tok = strtok(NULL, ",");
         sign = atoi(tok);
-        if(node1 == node2) continue;
-        // if both nodes exist, add the edge
-        if(node_order[node1] < num_nodes && node_order[node2] < num_nodes){
-            adj_list[node_order[node1]][node_order[node2]] = sign;
-            adj_list[node_order[node2]][node_order[node1]] = sign;
-        }
+        
+        adj_list[map_node1][map_node2] = static_cast<int8_t>(sign);
+        degree[map_node1] += 1;
+        adj_list[map_node2][map_node1] = static_cast<int8_t>(sign);
+        degree[map_node2] += 1;
     }
     fclose(fp);
-}
-
-
-void calculate_degree(vector<unordered_map<int,int>> &adj_list, vector<int> &degree){
-    int num_nodes = adj_list.size();
-    unordered_map<int, int>::iterator iter_1;
-    for(int i=0; i<num_nodes; ++i){
-        for(iter_1=adj_list[i].begin(); iter_1!=adj_list[i].end(); ++iter_1){
-            // degree = positive edges + negative edges
-            degree[i] += 1;
-        }
-    }
+    return degree;
 }
 
 
 // calculate the true number of wedges, balanced triangles, and unbalanced triangles
-void calculate_wedge_triangle(vector<unordered_map<int, int>> &adj_list, vector<unordered_map<int, pair<int,int>>> &num_wedges, long long &num_wedge_pairs, vector<long long> &num_triangles){
-    int i, j, k, sign_ij, sign_ik, sign_jk;
-    unordered_map<int, int>::iterator iter_1, iter_2;
+void calc_wedges_triangles_edge_scan(vector<flat_hash_map<int, int8_t>> &adj_list, vector<flat_hash_map<int, pair<uint16_t, uint16_t>>> &num_wedges, long long &num_wedge_pairs, vector<long long> &num_triangles){
+    int i, j, k;
+    int8_t sign_ij, sign_ik, sign_jk;
+    flat_hash_map<int, int8_t>::iterator iter_1, iter_2;
     int num_nodes = adj_list.size();
     num_wedge_pairs = 0;
     for(i=0; i<num_nodes; ++i){
@@ -197,8 +189,8 @@ void calculate_wedge_triangle(vector<unordered_map<int, int>> &adj_list, vector<
                 sign_ik = iter_2->second;
                 // calculate the number of wedges
                 if(num_wedges[j].count(k) == 0){
-                    if((sign_ij * sign_ik == 1)) num_wedges[j][k] = make_pair(1, 0);
-                    else num_wedges[j][k] = make_pair(0, 1);
+                    if((sign_ij * sign_ik == 1)) num_wedges[j][k] = make_pair((uint16_t)1, (uint16_t)0);
+                    else num_wedges[j][k] = make_pair((uint16_t)0, (uint16_t)1);
                     ++num_wedge_pairs;
                 } else{
                     if((sign_ij * sign_ik == 1)) num_wedges[j][k].first += 1;
@@ -219,7 +211,7 @@ void calculate_wedge_triangle(vector<unordered_map<int, int>> &adj_list, vector<
 
 
 // calculate local sensitivity at distance s
-int calculate_LS_distance_s(vector<unordered_map<int, int>> &adj_list, vector<int> &degree_list, vector<unordered_map<int, pair<int,int>>> &num_wedges, int distance){
+int calc_LS_distance_s(vector<flat_hash_map<int, int8_t>> &adj_list, vector<int> &degree_list, vector<flat_hash_map<int, pair<uint16_t,uint16_t>>> &num_wedges, int distance){
     int num_nodes = adj_list.size();
     int LS_s = 0;
     int i, j, w_ij_1, w_ij_2, w_ij_min, a_ij, t_ij, s, LS_s_1, LS_s_2;
@@ -266,19 +258,18 @@ int calculate_LS_distance_s(vector<unordered_map<int, int>> &adj_list, vector<in
             LS_s = std::max(LS_s, std::max(LS_s_1, LS_s_2));
         }
     }
-    // cout << "s = " << s << ", local sensitivity at distance s is " << LS_s << endl;
+    // cout << "distance s: " << s << ", LS(G, s): " << LS_s << endl;
     return LS_s;
 }
 
 
 // calculate local sensitivity
-int calculate_LS(vector<unordered_map<int,int>> &adj_list, vector<unordered_map<int, pair<int,int>>> &num_wedges){
+int calc_LS(vector<flat_hash_map<int,int8_t>> &adj_list, vector<flat_hash_map<int, pair<uint16_t,uint16_t>>> &num_wedges){
     int num_nodes = adj_list.size();
     int LS = 0;
     int i, j, w_pos, w_neg;
-    unordered_map<int,pair<int,int>>::iterator iter;
     for(i=0; i<num_nodes; ++i){
-        for(iter=num_wedges[i].begin(); iter != num_wedges[i].end(); ++iter){
+        for(auto iter=num_wedges[i].begin(); iter != num_wedges[i].end(); ++iter){
             j = iter->first;
             w_pos = iter->second.first;
             w_neg = iter->second.second;
@@ -288,35 +279,33 @@ int calculate_LS(vector<unordered_map<int,int>> &adj_list, vector<unordered_map<
             }
         }
     }
-    // cout << "Local sensitivity: " << LS << endl;
+    // cout << "LS: " << LS << endl;
     return LS;
 }
 
 
 // calculate smooth sensitivity: baseline method
-double calculate_SS_baseline(vector<unordered_map<int,int>> &adj_list, vector<int> &degree_list, vector<unordered_map<int,pair<int,int>>> &num_wedges, double beta){
+double calc_SS_baseline(vector<flat_hash_map<int,int8_t>> &adj_list, vector<int> &degree_list, vector<flat_hash_map<int,pair<uint16_t,uint16_t>>> &num_wedges, double beta){
     int num_nodes = adj_list.size();
     // compute the local sensitivity
-    int LS = calculate_LS(adj_list, num_wedges);
-    // cout << "LS: " << LS << endl;
+    int LS = calc_LS(adj_list, num_wedges);
     // when s = 0, smooth sensitivity = exp(-beta * 0) * LS
     double SS = (double)LS;
     int LS_s;
     int s_max = 2 * (num_nodes - 2) + 1;
     for(int s=1; s<s_max; ++s){
-        LS_s = calculate_LS_distance_s(adj_list, degree_list, num_wedges, s);
+        LS_s = calc_LS_distance_s(adj_list, degree_list, num_wedges, s);
         SS = std::max(SS, exp(-1.0 * (double)s * beta) * (double)LS_s);
     }
     return SS;
 }
 
 
-void calculate_LS_upper_bound(vector<unordered_map<int,int>> &adj_list, vector<unordered_map<int, pair<int,int>>> &num_wedges, int &LS_1, int &LS_2){
-    int num_nodes = adj_list.size();
+// calculate the upper bound of local sensitivity
+void calc_LS_upper_bound(vector<flat_hash_map<int, pair<uint16_t,uint16_t>>> &num_wedges, int &LS_1, int &LS_2, int num_nodes){
     int w_pos, w_neg;
-    unordered_map<int,pair<int,int>>::iterator iter;
     for(int i=0; i<num_nodes; ++i){
-        for(iter=num_wedges[i].begin(); iter != num_wedges[i].end(); ++iter){
+        for(auto iter=num_wedges[i].begin(); iter != num_wedges[i].end(); ++iter){
             w_pos = iter->second.first;
             w_neg = iter->second.second;
             LS_1 = std::max(LS_1, w_pos+w_neg);
@@ -326,9 +315,8 @@ void calculate_LS_upper_bound(vector<unordered_map<int,int>> &adj_list, vector<u
 }
 
 
-// calculate smooth upper bound on local sensitivity
-double calculate_SU(vector<unordered_map<int,int>> &adj_list, int LS_1, int LS_2, double beta){
-    int num_nodes = adj_list.size();
+// calculate the smooth upper bound of local sensitivity
+double calc_SU(int LS_1, int LS_2, int num_nodes, double beta){
     double SS = 0.0;
     double beta_inverse = 1.0 / beta;
     double s_optimal;
@@ -374,8 +362,8 @@ bool customCompare_3(const w_t_tuple &a, const w_t_tuple &b){
 }
 
 
-// calculate smooth sensitivity
-double calculate_SS(vector<unordered_map<int,int>> &adj_list, vector<int> &degree_list, vector<unordered_map<int,pair<int,int>>> &num_wedges, long long num_wedge_pairs, double beta){
+// calculate the smooth sensitivity: improved approach
+double calc_SS_improved_method(vector<flat_hash_map<int,int8_t>> &adj_list, vector<int> &degree_list, vector<flat_hash_map<int,pair<uint16_t,uint16_t>>> &num_wedges, long long num_wedge_pairs, double beta){
     int num_nodes = adj_list.size();
     double SS = 0.0;
     vector<w_t_tuple> w_t_vec(num_wedge_pairs+1);
@@ -451,6 +439,7 @@ double calculate_SS(vector<unordered_map<int,int>> &adj_list, vector<int> &degre
         SS = std::max(SS, exp(-1.0 * beta * (double)s) * (double)LS_s_1);
     }
     vector<w_t_pair>().swap(surs_pair);
+
     // sort the tuple according to "w_abs" and calculate the LS_s_2
     sort(w_t_vec.begin(), w_t_vec.end(), customCompare_2);
     vector<w_t_triplet> surs_triplet_1, surs_triplet_2, surs_triplet_3;
@@ -615,7 +604,7 @@ int main(int argc, char *argv[]){
         cout << "Usage: " << argv[0] << " [dataset] ([eps (default: 0.1)] [mech (default: 2)] [sample nodes (default: 1.0)] [iters (default: 1)] [repeats (default: 100)])" << endl;
         cout << "[dataset]: dataset name" << endl;
         cout << "[eps]: privacy budget" << endl;
-        cout << "[mech]: mechanism (0: GS 1: SS (baseline) 2: SS 3: SU" << endl;
+        cout << "[mech]: mechanism (0: GS 1: SS (baseline) 2: SS (improved) 3: SS (upper bound))" << endl;
         cout << "[sample nodes]: percentage of sample nodes (1.0: total nodes)" << endl;
         cout << "[iters]: number of iterations (works when the nodes are sampled)" << endl;
         cout << "[repeats]: number of repeats" << endl;
@@ -633,15 +622,15 @@ int main(int argc, char *argv[]){
     int num_iters = 1;
     int repeats = 100;
 
-    string edge_path = "./data/" + dataset + "_edges.csv";
+    string edge_path = "./data/" + dataset + "_undirect.csv";
     int total_num_nodes;
     int num_sample_nodes;
     double delta;
     vector<vector<int>> node_order;
-    vector<unordered_map<int, int>> adj_list;
+    vector<flat_hash_map<int, int8_t>> adj_list;
     vector<int> degree;
     //number of wedges: num_wedges[i][j].first: ++ and --, num_wedges[i][j].second: +-
-    vector<unordered_map<int, pair<int,int>>> num_wedges;
+    vector<flat_hash_map<int, pair<uint16_t,uint16_t>>> num_wedges;
     long long num_wedge_pairs;
     // number of balanced and unbalanced triangles
     vector<long long> num_triangles(2);
@@ -664,28 +653,28 @@ int main(int argc, char *argv[]){
         }
     }
     // get the total number of nodes --> num_nodes
-    total_num_nodes = get_total_num_nodes(edge_path);
+    total_num_nodes = total_nodes_count(edge_path);
     num_sample_nodes = (int)(sample_percentage * (double)total_num_nodes);
-    generate_node_order(dataset, num_sample_nodes, total_num_nodes, num_iters, node_order);
+    create_node_order(dataset, num_sample_nodes, total_num_nodes, num_iters, node_order);
     cout << "dataset: " << dataset << " eps: " << eps << " mech: " << mech << " total_num_nodes: " << total_num_nodes << " sample_percentage: " << sample_percentage << " num_iters: " << num_iters << " repeats: " << repeats << endl;
     delta = 1.0 / (10.0 * (double)(num_sample_nodes) * (double)(num_sample_nodes - 1) / 2.0);
 
     for(int i=0; i<num_iters; ++i){
         // initialization
-        adj_list = vector<unordered_map<int, int>>(num_sample_nodes);
-        degree = vector<int>(num_sample_nodes, 0);
-        num_wedges = vector<unordered_map<int, pair<int, int>>>(num_sample_nodes);
+        adj_list = vector<flat_hash_map<int, int8_t>>(num_sample_nodes);
+        num_wedges = vector<flat_hash_map<int, pair<uint16_t, uint16_t>>>(num_sample_nodes);
         num_triangles[0] = 0;
         num_triangles[1] = 0;
         // load edges from the edge file --> adj_list and degree
-        load_adj_list(edge_path, node_order[i], adj_list);
-        calculate_degree(adj_list, degree);
+        degree = load_adj_list(edge_path, node_order[i], adj_list);
         // calculate the true number of wedges and triangles
-        calculate_wedge_triangle(adj_list, num_wedges, num_wedge_pairs, num_triangles);
+        calc_wedges_triangles_edge_scan(adj_list, num_wedges, num_wedge_pairs, num_triangles);
+
         // calculate the noisy number of balanced and unbalanced triangles
         if(mech == 0){
             double GS;
             GS = double(2 * num_sample_nodes - 4);
+            // cout << "mech: " << mech << " GS: " << GS << endl;
             for(int repeat=0; repeat<repeats; ++repeat){
                 if(genrand_real2() >= delta){
                     num_ns_triangles[0] = (double)num_triangles[0] + stats::rlaplace(0.0, GS/eps, engine);
@@ -705,24 +694,22 @@ int main(int argc, char *argv[]){
         } else{
             double SS = 0.0;
             double beta = eps / (4.0*(2.0+log(2.0/delta)));
-            // judge: SS = LS_uppper_bound or SS != LS_upper_bound
-            int LS_1=0, LS_2=0;
-            calculate_LS_upper_bound(adj_list, num_wedges, LS_1, LS_2);
-            double beta_inverse = 1.0 / beta;
-            // cout << "LS_1: " << LS_1 << " LS_2: " << LS_2 << " beta_inverse: " << beta_inverse << endl;
-            if(beta_inverse <= double(LS_1) && beta_inverse <= double(LS_2)/4.0){
-                SS = std::max((double)LS_1, (double)LS_2);
-            }
             if(mech == 1){
-                SS = calculate_SS_baseline(adj_list, degree, num_wedges, beta);
+                SS = calc_SS_baseline(adj_list, degree, num_wedges, beta);
+                // cout << "mech: " << mech << " SS: " << SS << endl;
             } else if(mech == 2){
-                SS = calculate_SS(adj_list, degree, num_wedges, num_wedge_pairs, beta);
+                SS = calc_SS_improved_method(adj_list, degree, num_wedges, num_wedge_pairs, beta);
+                // cout << "mech: " << mech << " SS: " << SS << endl;
             } else if(mech == 3){
-                calculate_LS_upper_bound(adj_list, num_wedges, LS_1, LS_2);
-                SS = calculate_SU(adj_list, LS_1, LS_2, beta);
+                int LS_1=0, LS_2=0;
+                calc_LS_upper_bound(num_wedges, LS_1, LS_2, adj_list.size());
+                SS = calc_SU(LS_1, LS_2, adj_list.size(), beta);
+                // cout << "mech: " << mech << " LS_1: " << LS_1 << " LS_2: " << LS_2 << " SS: " << SS << endl;
             }
             for(int repeat=0; repeat<repeats; ++repeat){
+                // num_ns_triangles[0] = num_triangles[0] + stats::rcauchy(0.0, sqrt(2.0)*SS/eps, engine);
                 num_ns_triangles[0] = num_triangles[0] + stats::rlaplace(0.0, 2.0*SS/eps, engine);
+                // num_ns_triangles[1] = num_triangles[1] + stats::rcauchy(0.0, sqrt(2.0)*SS/eps, engine);
                 num_ns_triangles[1] = num_triangles[1] + stats::rlaplace(0.0, 2.0*SS/eps, engine);
                 num_ns_triangles[0] = std::max(0.0, num_ns_triangles[0]);
                 num_ns_triangles[1] = std::max(0.0, num_ns_triangles[1]);
@@ -732,12 +719,13 @@ int main(int argc, char *argv[]){
                 relative_error_l1_avg += relative_error_l1;
             }
         }
-        vector<unordered_map<int, pair<int, int>>>().swap(num_wedges);
+        // release memory
+        vector<flat_hash_map<int, pair<uint16_t, uint16_t>>>().swap(num_wedges);
         vector<int>().swap(degree);
-        vector<unordered_map<int, int>>().swap(adj_list);
+        vector<flat_hash_map<int, int8_t>>().swap(adj_list);
     }
     cout << "Average Absolute Error: " << absolute_error_l1_avg/(double)(num_iters*repeats) << " Average Relative Error: " << relative_error_l1_avg/(double)(num_iters*repeats) << endl;
-    cout << "*******************************************************************************" << endl;
+    cout << "**********************************************************************" << endl;
     vector<vector<int>>().swap(node_order);
     return 0;
 }

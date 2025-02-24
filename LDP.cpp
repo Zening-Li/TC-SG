@@ -2,19 +2,17 @@
 #include <string>
 #include <fstream>
 #include <cmath>
-#include <unordered_map>
 #include <algorithm>
 
 #include <string.h>
 #include <math.h>
-#include <time.h>
-#include <unistd.h>
 
-#include "include/stats.hpp"
 #include "include/mt19937ar.h"
-
+#include "include/stats.hpp"
+#include "include/parallel_hashmap/phmap.h"
 
 using namespace std;
+using phmap::flat_hash_map;
 
 // initialization of statslib
 stats::rand_engine_t engine(1776);
@@ -36,7 +34,7 @@ bool check_file_existence(const string &file_path){
 }
 
 
-int get_total_num_nodes(const string &edge_path){
+int total_nodes_count(const string &edge_path){
     FILE *fp;
     char str[1025];
     char *ptr, *temp;
@@ -54,25 +52,23 @@ int get_total_num_nodes(const string &edge_path){
 
 
 // randomly generate 0, 1, ..., size-1, and store the first 'num' values into rndperm
-void generate_random_permutation(vector<int> &rndperm, int size, int num){
-    int rnd;
-    vector<int> ordperm(size);
-    // 0, 1, 2, ..., size-1 --> ordperm
-    for(int i=0; i<size; ++i){
-        ordperm[i] = i;
+void create_random_permutation(std::vector<int> &rndperm, int size, int num) {
+    std::vector<int> ordperm(size);
+    // create an ordered permutation
+    std::iota(ordperm.begin(), ordperm.end(), 0);
+    
+    // Fisher-Yates shuffle
+    for (int i = 0; i < num; ++i) {
+        int rnd = i + (genrand_int32() % (size - i));
+        std::swap(ordperm[i], ordperm[rnd]);
+        rndperm[i] = ordperm[i];
     }
-    for(int i=0; i<num; ++i){
-        rnd = genrand_int32() % (size - i);
-        rndperm[i] = ordperm[rnd];
-        for(int j=rnd+1; j<size-i; ++j){
-            ordperm[j - 1] = ordperm[j];
-        }
-    }
-    vector<int>().swap(ordperm);
+    ordperm.clear();
+    ordperm.shrink_to_fit();
 }
 
 
-void generate_node_order(const string &dataset, int &num_sample_nodes, const int &total_num_nodes, int &num_iters, vector<vector<int>> &node_order){
+void create_node_order(const string &dataset, int &num_sample_nodes, const int &total_num_nodes, int &num_iters, vector<vector<int>> &node_order){
     if(num_sample_nodes == total_num_nodes){ // use all nodes to calculate the number of triangles
         num_iters = 1;
         node_order = vector<vector<int>>(num_iters, vector<int>(total_num_nodes));
@@ -81,7 +77,7 @@ void generate_node_order(const string &dataset, int &num_sample_nodes, const int
         }
     } else{ // randomly generate the order of nodes --> node_order
         FILE *fp;
-        string outfile = "./results/"+dataset+"/node_order_iters_"+to_string(num_iters)+".csv";
+        string outfile = "./data/"+dataset+"_node_order_iters_"+to_string(num_iters)+".csv";
         int i, j;
         node_order = vector<vector<int>>(num_iters, vector<int>(total_num_nodes));
         if(check_file_existence(outfile)){
@@ -98,7 +94,7 @@ void generate_node_order(const string &dataset, int &num_sample_nodes, const int
             fclose(fp);
         } else{
             for(j=0; j<num_iters; ++j){
-                generate_random_permutation(node_order[j], total_num_nodes, total_num_nodes);
+                create_random_permutation(node_order[j], total_num_nodes, total_num_nodes);
             }
             fp = open_file(outfile, "w");
             for(i=0; i<total_num_nodes; ++i){
@@ -115,16 +111,16 @@ void generate_node_order(const string &dataset, int &num_sample_nodes, const int
 
 
 // load adjacency list from the edge file
-void load_adj_list(const string &edge_path, vector<int> &node_order, vector<unordered_map<int,int>> &adj_list){
+vector<int> load_adj_list(const string &edge_path, vector<int> &node_order, vector<flat_hash_map<int, int8_t>> &adj_list, vector<int> &degree){
     int node1, node2, sign;
-    FILE *fp;
-    char str[1025];
-    char *tok, *temp;
-
+    int map_node1, map_node2;
+    char str[1025], *tok;
     int num_nodes = adj_list.size();
-    fp = open_file(edge_path, "r");
+    vector<int> ldegree(num_nodes, 0);
+
+    FILE *fp = open_file(edge_path, "r");
     // skip the first line of data
-    temp = fgets(str, 1024, fp);
+    char *temp = fgets(str, 1024, fp);
     while(fgets(str, 1024, fp) != NULL){
         // 1st node --> node1
         // ascii(string) to int
@@ -133,40 +129,33 @@ void load_adj_list(const string &edge_path, vector<int> &node_order, vector<unor
         // 2nd node --> node2
         tok = strtok(NULL, ",");
         node2 = atoi(tok);
+        if(node1 == node2) continue;
+
+        map_node1 = node_order[node1];
+        map_node2 = node_order[node2];
+        if(map_node1 >= num_nodes || map_node2 >= num_nodes) continue;
+
         // sign
         tok = strtok(NULL, ",");
         sign = atoi(tok);
-        if(node1 == node2) continue;
-        // if both nodes exist, add the edge
-        if(node_order[node1] < num_nodes && node_order[node2] < num_nodes){
-            adj_list[node_order[node1]][node_order[node2]] = sign;
-            adj_list[node_order[node2]][node_order[node1]] = sign;
-        }
+
+        adj_list[map_node1][map_node2] = static_cast<int8_t>(sign);
+        ++degree[map_node1];
+        adj_list[map_node2][map_node1] = static_cast<int8_t>(sign);
+        ++degree[map_node2];
+        // calculate the degree from the lower triangular part of the adjacency matrix
+        if(map_node1 > map_node2) ++ldegree[map_node1];
+        else ++ldegree[map_node2];
     }
     fclose(fp);
+    return ldegree;
 }
 
 
-void calculate_degree(vector<unordered_map<int,int>> &adj_list, vector<int> &degree, vector<int> &ldegree){
-    int i, j;
-    unordered_map<int, int>::iterator iter_1;
-
-    int num_nodes = adj_list.size();
-    for(i=0; i<num_nodes; ++i){
-        for(iter_1=adj_list[i].begin(); iter_1!=adj_list[i].end(); ++iter_1){
-            j = iter_1->first;
-            // degree = positive edges + negtive edges
-            degree[i] += 1;
-            // calculate the degree from the lower triangular part of the adjacency matrix
-            if(i > j) ldegree[i] += 1;
-        }
-    }
-}
-
-
-void calculate_triangles(vector<unordered_map<int,int>> &adj_list, vector<long long> &num_triangles){
-    int i, j, k, sign_ij, sign_ik, sign_jk;
-    unordered_map<int, int>::iterator iter_1, iter_2;
+void calc_triangles(vector<flat_hash_map<int, int8_t>> &adj_list, vector<long long> &num_triangles){
+    int i, j, k;
+    int8_t sign_ij, sign_ik, sign_jk;
+    flat_hash_map<int, int8_t>::iterator iter_1, iter_2, iter_3;
 
     int num_nodes = adj_list.size();
     for(i=0; i<num_nodes; ++i){
@@ -179,8 +168,10 @@ void calculate_triangles(vector<unordered_map<int,int>> &adj_list, vector<long l
                 k = iter_2->first;
                 if(j <= k) continue;
                 sign_ik = iter_2->second;
-                if(adj_list[j].count(k) > 0){
-                    sign_jk = adj_list[j][k];
+
+                iter_3 = adj_list[j].find(k);
+                if(iter_3 != adj_list[j].end()){
+                    sign_jk = iter_3->second;
                     if((sign_ij * sign_ik * sign_jk) == 1) num_triangles[0] += 1;
                     else num_triangles[1] += 1;
                 }
@@ -191,7 +182,7 @@ void calculate_triangles(vector<unordered_map<int,int>> &adj_list, vector<long l
 
 
 // calculate the noisy max degree
-void calculate_noisy_max_degree(vector<int> &degree, double eps, int &max_degree, double &ns_max_degree){
+void calc_noisy_max_degree(vector<int> &degree, double eps, int &max_degree, double &ns_max_degree){
     double ns_degree;
     max_degree = 0;
     ns_max_degree = 0.0;
@@ -211,61 +202,58 @@ void calculate_noisy_max_degree(vector<int> &degree, double eps, int &max_degree
 }
 
 
-// generalized randomized response mechanism
-inline int GRR(int v, double q, vector<int> &values){
-    if(genrand_real1() >= q){ // not flip
-        return v;
-    } else{
-        vector<int> candidate_values;
-        for(int value : values){
-            if(value != v){
-                candidate_values.emplace_back(value);
-            }
-        }
-        return candidate_values[genrand_int32() % 2];
+// GRR mechanism
+inline int8_t GRR(int8_t v, double q) {
+    double rand_v = genrand_real1();
+    if(rand_v >= q) return v;
+    double half = q / 2.0;
+    switch (v) {
+        case 0:
+            return rand_v < half ? 1 : -1;
+        case 1:
+            return rand_v < half ? 0 : -1;
+        case -1:
+            return rand_v < half ? 0 : 1;
+        default:
+            return 0;
     }
 }
 
 
-// calculate balanced and unbalanced triangle counts in the non-interactive local model
-void calculate_triangle_non_interactive(vector<unordered_map<int, int>> &adj_list, double eps, int estimate_flag, vector<double> &num_ns_triangles){
+// calculate #balanced and #unbalanced triangles in the non-interactive local model
+void calc_triangle_non_interactive(vector<flat_hash_map<int, int8_t>> &adj_list, double eps, bool estimate_flag, vector<double> &num_ns_triangles){
     int num_nodes = adj_list.size();
     // noisy adjacency list
-    vector<unordered_map<int, int>> ns_adj_list(num_nodes);
+    vector<flat_hash_map<int, int8_t>> ns_adj_list(num_nodes);
     // noisy degree
     vector<int> ns_degree(num_nodes, 0);
     long long num_ns_balanced_triangles = 0;
     long long num_ns_unbalanced_triangles = 0;
-    long long num_ns_edges = 0;
     // flip probability
     double filp_prob;
-    int i, j, k, sign_ij, sign_ik, sign_jk;
-    unordered_map<int, int>::iterator iter_1, iter_2;
+    int i, j, k;
+    int8_t sign_ij, sign_ik, sign_jk;
+    flat_hash_map<int, int8_t>::iterator iter_1, iter_2, iter_3;
 
     // the flip probability
     filp_prob = 2.0 / (exp(eps) + 2.0);
-    vector<int> values = {0, +1, -1};
 
     // flip 0/1 in adj_list with probability q --> ns_adj_list
     for(i=0; i<num_nodes; ++i){
+        auto &cur_adj = adj_list[i];
         for(j=0; j<i; ++j){
-            if(adj_list[i].count(j) == 0) sign_ij = GRR(0, filp_prob, values);
-            else sign_ij = GRR(adj_list[i][j], filp_prob, values);
+            iter_1 = cur_adj.find(j);
+            if(iter_1 == cur_adj.end()) sign_ij = GRR(0, filp_prob);
+            else sign_ij = GRR(iter_1->second, filp_prob);
             if(sign_ij != 0){
                 ns_adj_list[i][j] = sign_ij;
-                ns_adj_list[j][i] = sign_ij;
+                ++ns_degree[i];
+                ++ns_degree[j];
             }
         }
     }
-    // calculate the degree of each user in the noisy graph
-    for(i=0; i<num_nodes; ++i){
-        for(iter_1=ns_adj_list[i].begin(); iter_1!=ns_adj_list[i].end(); ++iter_1) ++ns_degree[i];
-    }
-    // calculate the total number of edges
-    for(i=0; i<num_nodes; ++i) num_ns_edges += (long long)ns_degree[i];
-    num_ns_edges /= 2;
 
-    // calculate the number of balanced and unbalanced triangles in the noisy graph
+    // calculate #balanced and unbalanced triangles in the noisy graph
     for(i=0; i<num_nodes; ++i){
         for(iter_1 = ns_adj_list[i].begin(); iter_1 != ns_adj_list[i].end(); ++iter_1){
             j = iter_1->first;
@@ -276,8 +264,9 @@ void calculate_triangle_non_interactive(vector<unordered_map<int, int>> &adj_lis
                 k = iter_2->first;
                 if(j<=k) continue;
                 sign_ik = iter_2->second;
-                if(ns_adj_list[j].count(k) > 0){
-                    sign_jk = ns_adj_list[j][k];
+                iter_3 = ns_adj_list[j].find(k);
+                if(iter_3 != ns_adj_list[j].end()){
+                    sign_jk = iter_3->second;
                     if((sign_ij * sign_ik * sign_jk) == 1) ++num_ns_balanced_triangles;
                     else ++num_ns_unbalanced_triangles;
                 }
@@ -286,9 +275,11 @@ void calculate_triangle_non_interactive(vector<unordered_map<int, int>> &adj_lis
     }
 
     // empirical estimation
-    if(estimate_flag == 1){
+    if(estimate_flag){
         long long num_ns_2_stars = 0;
+        long long num_ns_edges = 0;
         for(i=0; i<num_nodes; ++i){
+            num_ns_edges += (long long)ns_degree[i];
             num_ns_2_stars += ((long long)ns_degree[i] * ((long long)ns_degree[i]-1)) / 2;
         }
 
@@ -318,19 +309,16 @@ void calculate_triangle_non_interactive(vector<unordered_map<int, int>> &adj_lis
         num_ns_triangles[1] = (double)num_ns_unbalanced_triangles;
     }
     vector<int>().swap(ns_degree);
-    vector<unordered_map<int, int>>().swap(ns_adj_list);
+    vector<flat_hash_map<int, int8_t>>().swap(ns_adj_list);
 }
 
 
-// calculate balanced and unbalanced triangle counts in the interactive local model
-void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, int SS_tag, double eps_degree, double eps_adj, double eps_triangle, double delta, vector<double> &num_ns_triangles){
+// calculate #balanced and unbalanced triangles in the interactive local model
+void calc_triangles_interactive(vector<flat_hash_map<int, int8_t>> &adj_list, vector<int> &degree, vector<int> &ldegree, bool SS_tag, double eps_degree, double eps_adj, double eps_triangle, double delta, vector<double> &num_ns_triangles){
     int num_nodes = adj_list.size();
-    vector<int> degree(num_nodes);
-    vector<int> ldegree(num_nodes);
-    calculate_degree(adj_list, degree, ldegree);
     // noisy adjacency list
-    vector<unordered_map<int, int>> ns_adj_list(num_nodes);
-    // the number of balanced and unbalanced triangles for each user
+    vector<flat_hash_map<int, int8_t>> ns_adj_list(num_nodes);
+    // #balanced and unbalanced triangles for each user
     vector<long long> num_ns_b_triangles_user(num_nodes, 0);
     vector<long long> num_ns_u_triangles_user(num_nodes, 0);
     vector<long long> num_2_stars_user(num_nodes, 0);
@@ -338,17 +326,17 @@ void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, i
     double filp_prob, q;
     int max_degree, ns_max_degree_floor;
     double ns_max_degree;
-    int i, j, k, index, sign_ij, sign_ik, sign_jk;
-    unordered_map<int, int>::iterator iter_1, iter_2;
+    int i, j, k, index;
+    int8_t sign_ij, sign_ik, sign_jk;
+    flat_hash_map<int, int8_t>::iterator iter_1, iter_2, iter_3, iter_4;
+
     vector<int> rndperm;
     double beta = eps_triangle / (4.0*(2.0+log(2.0/delta)));
 
     // flip probability
     q = 1.0 / (exp(eps_adj) + 2.0);
     filp_prob = 2.0 * q;
-    vector<int> values = {0, +1, -1};
 
-    // generalized randomized response --> ns_adj_list
     for(i=0; i<num_nodes; ++i){
         for(iter_1=adj_list[i].begin(); iter_1!=adj_list[i].end(); ++iter_1){
             j = iter_1->first;
@@ -360,27 +348,33 @@ void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, i
                 if(j<=k) continue;
                 sign_ik = iter_2->second;
                 num_2_stars_user[i] += 1;
+
+                // GRR --> ns_adj_list
+                iter_3 = ns_adj_list[j].find(k);
                 // if ns_adj_list[j][k] does not exist
-                if(ns_adj_list[j].count(k) == 0){
-                    if(adj_list[j].count(k) == 0) sign_jk = GRR(0, filp_prob, values);
-                    else sign_jk = GRR(adj_list[j][k], filp_prob, values);
+                if(iter_3 == ns_adj_list[j].end()){
+                    iter_4 = adj_list[j].find(k);
+                    if(iter_4 == adj_list[j].end()) sign_jk = GRR(0, filp_prob);
+                    else sign_jk = GRR(iter_4->second, filp_prob);
                     ns_adj_list[j][k] = sign_jk;
+                } else{
+                    sign_jk = iter_3->second;
                 }
-                sign_jk = ns_adj_list[j][k];
-                if((sign_ij * sign_ik * sign_jk) == 1){
+                if(sign_ij * sign_ik * sign_jk == 1){
                     num_ns_b_triangles_user[i] += 1;
-                } else if((sign_ij * sign_ik * sign_jk) == -1){
+                } else if (sign_ij * sign_ik * sign_jk == -1){
                     num_ns_u_triangles_user[i] += 1;
                 }
             }
         }
     }
-    if(SS_tag == 0){
+
+    if(SS_tag == false){
         // deleted adjacency list after projection
-        vector<unordered_map<int, int>> deleted_adj_list(num_nodes);
+        vector<flat_hash_map<int, int8_t>> deleted_adj_list(num_nodes);
         // noisy max degree: degree + Lap
         // use the noisy max degree to calculate the global sensitivity
-        calculate_noisy_max_degree(degree, eps_degree, max_degree, ns_max_degree);
+        calc_noisy_max_degree(degree, eps_degree, max_degree, ns_max_degree);
 
         // if max_degree exceeds ns_max_degree, then perform graph projection
         if((double)max_degree > ns_max_degree){
@@ -390,7 +384,7 @@ void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, i
                 if(degree[i] > ns_max_degree){
                     // randomly generate 0, 1, ..., degree[i]-1 --> rndperm
                     rndperm = vector<int>(degree[i]);
-                    generate_random_permutation(rndperm, degree[i], degree[i]);
+                    create_random_permutation(rndperm, degree[i], degree[i]);
 
                     // randomly delete (degree[i] - max_deg_ns) edges from adj_list[i]
                     index = 0;
@@ -431,10 +425,10 @@ void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, i
                 }
             }
         }
-        vector<unordered_map<int, int>>().swap(deleted_adj_list);
+
+        vector<flat_hash_map<int, int8_t>>().swap(deleted_adj_list);
 
         double GS = std::max(ns_max_degree, 2.0*(ns_max_degree-1.0));
-
         for(i=0; i<num_nodes; ++i){
             // balanced triangles
             num_ns_b_triangles = (double)num_ns_b_triangles_user[i] - q*(double)num_2_stars_user[i];
@@ -469,20 +463,23 @@ void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, i
                     SS = std::max(SS, exp(-1.0*beta*(double)s_floor) * 2.0 * (double)(ldegree_user+s_floor-1));
                     s_ceil = ceil(s_optimal);
                     SS = std::max(SS, exp(-1.0*beta*(double)s_ceil) * 2.0 * (double)(ldegree_user+s_ceil-1));
-                } else if(1.0 < s_optimal <= 2.0){
+                } else if(1.0 < s_optimal && s_optimal <= 2.0){
                     SS = std::max(SS, exp(-2.0*beta) * 2.0 * (double)(ldegree_user+1));
                 }
             } else{
                 SS = std::max(SS, exp(-1.0*beta*(double)(i-ldegree_user)) * 2.0 * (double)(i-1));
             }
             num_ns_b_triangles = (double)num_ns_b_triangles_user[i] - q*(double)num_2_stars_user[i];
+            // num_ns_b_triangles = (double)num_ns_b_triangles_user[i];
             // add the noise for each user
             num_ns_b_triangles +=  stats::rlaplace(0.0, 2.0*SS/eps_triangle, engine);
-            num_ns_triangles[0] += num_ns_b_triangles;
 
             // unbalanced triangles
             num_ns_u_triangles = (double)num_ns_u_triangles_user[i] - q*(double)num_2_stars_user[i];
+            // num_ns_u_triangles = (double)num_ns_u_triangles_user[i];
             num_ns_u_triangles += stats::rlaplace(0.0, 2.0*SS/eps_triangle, engine);
+
+            num_ns_triangles[0] += num_ns_b_triangles;
             num_ns_triangles[1] += num_ns_u_triangles;
         }
     }
@@ -496,18 +493,18 @@ void calculate_triangle_interactive(vector<unordered_map<int, int>> &adj_list, i
     vector<long long>().swap(num_2_stars_user);
     vector<long long>().swap(num_ns_u_triangles_user);
     vector<long long>().swap(num_ns_b_triangles_user);
-    vector<unordered_map<int, int>>().swap(ns_adj_list);
+    vector<flat_hash_map<int, int8_t>>().swap(ns_adj_list);
 }
 
 
 int main(int argc, char *argv[]){
     if(argc < 2){
-        cout << "Usage: " << argv[0] << " [dataset] ([eps (default: 1.0)] [eps-alloc (default: 2-9-9)]) [mech (default: 3)] [sample nodes (default: -1)] [iters (default: 1)] [repeats (default: 100)])" << endl;
+        cout << "Usage: " << argv[0] << " [dataset] ([eps (default: 1.0)] [eps-alloc (default: 2-9-9)]) [mech (default: 3)] [sample nodes (default: 1.0)] [iters (default: 1)] [repeats (default: 100)])" << endl;
         cout << "[dataset]: dataset name" << endl;
         cout << "[eps]: privacy budget" << endl;
         cout << "[eps-alloc]: privacy budget allocation: degree-adj-triangle" << endl;
-        cout << "[mech]: mechanism (0: non-interactive local model (w/o empirical estimation) 1: non-interactive local model (w/ empirical estimation) 2: interactive local model (GS projection), 3: interactive local model (SU))" << endl;
-        cout << "[sample nodes]: number of sample nodes (1.0: total nodes)" << endl;
+        cout << "[mech]: mechanism (0: non-interactive local model (w/o empirical estimation) 1: non-interactive local model (w/ empirical estimation) 2: interactive local model (GS projection), 3: interactive local model (SS))" << endl;
+        cout << "[sample nodes]: percentage of sample nodes (1.0: total nodes)" << endl;
         cout << "[iters]: number of iterations (works when the nodes are sampled)" << endl;
         cout << "[repeats]: number of repeats" << endl;
         exit(-1);
@@ -525,20 +522,21 @@ int main(int argc, char *argv[]){
     int repeats = 100;
     double eps_alloc[3] = {2.0, 9.0, 9.0};
 
-    string edge_path = "./data/" + dataset + "_edges.csv";
-    int total_num_nodes;
-    int num_sample_nodes;
+    string edge_path = "./data/" + dataset + "_undirect.csv";
+    int total_num_nodes, num_sample_nodes;
     double delta;
     char *tok;
     vector<vector<int>> node_order;
-    vector<unordered_map<int, int>> adj_list;
-    // number of balanced and unbalanced triangles
+    vector<flat_hash_map<int, int8_t>> adj_list;
+    vector<int> degree;
+    vector<int> ldegree;
+    // #balanced and unbalanced triangles
     vector<long long> num_triangles(2);
     vector<double> num_ns_triangles(2);
     double absolute_error_l1 = 0.0, absolute_error_l1_avg = 0.0;
     double relative_error_l1 = 0.0, relative_error_l1_avg = 0.0;
 
-    // Assign the values of command line arguments to variables
+    // assign the values of command line arguments to variables
     if(argc > 2){
         total_eps = atof(argv[2]);
         if(argc > 3){
@@ -560,7 +558,7 @@ int main(int argc, char *argv[]){
             if(argc > 4){
                 mech = atoi(argv[4]);
                 if(argc > 5){
-                    sample_percentage = atoi(argv[5]);
+                    sample_percentage = atof(argv[5]);
                     if(argc > 6){
                         num_iters = atoi(argv[6]);
                     if(argc > 7) repeats = atoi(argv[7]);
@@ -569,10 +567,10 @@ int main(int argc, char *argv[]){
             }
         }
     }
-    // get the total number of nodes --> num_nodes
-    total_num_nodes = get_total_num_nodes(edge_path);
+    // get #total nodes --> num_nodes
+    total_num_nodes = total_nodes_count(edge_path);
     num_sample_nodes = (int)(sample_percentage * (double)total_num_nodes);
-    generate_node_order(dataset, num_sample_nodes, total_num_nodes, num_iters, node_order);
+    create_node_order(dataset, num_sample_nodes, total_num_nodes, num_iters, node_order);
     double eps_degree, eps_adj, eps_triangle;
     if(mech == 0 || mech == 1){
         eps_adj = total_eps;
@@ -584,39 +582,43 @@ int main(int argc, char *argv[]){
         eps_adj = total_eps / (eps_alloc[1]+eps_alloc[2]) * eps_alloc[1];
         eps_triangle = total_eps / (eps_alloc[1]+eps_alloc[2]) * eps_alloc[2];
     }
-
-    cout << "dataset: " << dataset << " total eps: " << total_eps << " " << eps_alloc[0] << "-" << eps_alloc[1] << "-" << eps_alloc[2] << " mech: " << mech << " total_num_nodes: " << total_num_nodes << " num_sample_nodes: " << num_sample_nodes << " num_iters: " << num_iters << " repeats: " << repeats << endl;
     delta = 1.0 / (10.0 * (double)(num_sample_nodes));
+
+    cout << "dataset: " << dataset << " total eps: " << total_eps << " " << eps_alloc[0] << "-" << eps_alloc[1] << "-" << eps_alloc[2] << " mech: " << mech << " total_num_nodes: " << total_num_nodes << " sample_percentage: " << sample_percentage << " num_iters: " << num_iters << " repeats: " << repeats << endl;
 
     for(int i=0; i<num_iters; ++i){
         // Initialization
-        adj_list = vector<unordered_map<int, int>>(num_sample_nodes);
+        adj_list = vector<flat_hash_map<int, int8_t>>(num_sample_nodes);
+        degree = vector<int>(num_sample_nodes);
         num_triangles[0] = 0;
         num_triangles[1] = 0;
         // load edges from the edge file --> adj_list
-        load_adj_list(edge_path, node_order[i], adj_list);
-        calculate_triangles(adj_list, num_triangles);
+        ldegree = load_adj_list(edge_path, node_order[i], adj_list, degree);
+        calc_triangles(adj_list, num_triangles);
+
         for(int repeat=0; repeat<repeats; ++repeat){
             num_ns_triangles[0] = 0.0;
             num_ns_triangles[1] = 0.0;
             if(mech == 0){
-                calculate_triangle_non_interactive(adj_list, eps_adj, 0, num_ns_triangles);
+                calc_triangle_non_interactive(adj_list, eps_adj, false, num_ns_triangles);
             } else if(mech == 1){
-                calculate_triangle_non_interactive(adj_list, eps_adj, 1, num_ns_triangles);
+                calc_triangle_non_interactive(adj_list, eps_adj, true, num_ns_triangles);
             } else if(mech == 2){
-                calculate_triangle_interactive(adj_list, 0, eps_degree, eps_adj, eps_triangle, delta, num_ns_triangles);
+                calc_triangles_interactive(adj_list, degree, ldegree, false, eps_degree, eps_adj, eps_triangle, delta, num_ns_triangles);
             } else{
-                calculate_triangle_interactive(adj_list, 1, eps_degree, eps_adj, eps_triangle, delta, num_ns_triangles);
+                calc_triangles_interactive(adj_list, degree, ldegree, true, eps_degree, eps_adj, eps_triangle, delta, num_ns_triangles);
             }
             absolute_error_l1 = fabs(num_ns_triangles[0]-(double)num_triangles[0]) + fabs(num_ns_triangles[1]-(double)num_triangles[1]);
             relative_error_l1 = absolute_error_l1 / ((double)num_triangles[0] + (double)num_triangles[1]);
             absolute_error_l1_avg += absolute_error_l1;
             relative_error_l1_avg += relative_error_l1;
         }
-        vector<unordered_map<int, int>>().swap(adj_list);
+        vector<int>().swap(degree);
+        vector<int>().swap(ldegree);
+        vector<flat_hash_map<int, int8_t>>().swap(adj_list);
     }
     cout << "Average Absolute Error: " << absolute_error_l1_avg/(double)(num_iters*repeats) << " Average Relative Error: " << relative_error_l1_avg/(double)(num_iters*repeats) << endl;
-    cout << "*******************************************************************************" << endl;
+    cout << "**********************************************************************" << endl;
     vector<vector<int>>().swap(node_order);
     return 0;
 }
